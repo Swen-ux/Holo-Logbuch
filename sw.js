@@ -1,7 +1,7 @@
 // Holo-Logbuch (Datenschutz-Version): alles liegt lokal, es gibt keine Anfragen an fremde Server.
 // Bei jedem Update die Versionsnummer erhöhen.
-const CACHE = "holo-logbuch-privat-v54";
-const FILES = ["./", "index.html", "manifest.webmanifest", "icon-192.png", "icon-512.png", "icon-180.png", "lib/CopyShader.js", "lib/EffectComposer.js", "lib/LuminosityHighPassShader.js", "lib/RenderPass.js", "lib/ShaderPass.js", "lib/UnrealBloomPass.js", "lib/three.min.js", "fonts/oxanium-latin-400-normal.woff2", "fonts/oxanium-latin-600-normal.woff2", "fonts/oxanium-latin-700-normal.woff2", "fonts/saira-latin-300-normal.woff2", "fonts/saira-latin-400-normal.woff2", "fonts/saira-latin-500-normal.woff2"];
+const CACHE = "holo-logbuch-privat-v55";
+const FILES = ["./", "index.html", "manifest.webmanifest", "icon-192.png", "icon-512.png", "icon-180.png", "CopyShader.js", "EffectComposer.js", "LuminosityHighPassShader.js", "RenderPass.js", "ShaderPass.js", "UnrealBloomPass.js", "three.min.js", "oxanium-latin-400-normal.woff2", "oxanium-latin-600-normal.woff2", "oxanium-latin-700-normal.woff2", "saira-latin-300-normal.woff2", "saira-latin-400-normal.woff2", "saira-latin-500-normal.woff2"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", e => {
   e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))));
