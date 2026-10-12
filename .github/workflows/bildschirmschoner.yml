@@ -1,0 +1,426 @@
+# Baut die Android-Bildschirmschoner-App (APK) für das Holo-Logbuch.
+# Läuft automatisch, wenn index.html geändert wird, oder per Hand unter Actions → "Bildschirmschoner-App bauen" → "Run workflow".
+# Das fertige APK liegt danach unter Releases → "Bildschirmschoner".
+name: Bildschirmschoner-App bauen
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "index.html"
+      - ".github/workflows/bildschirmschoner.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Android-Projekt anlegen
+        run: |
+          mkdir -p "$(dirname 'android/app/build.gradle')"
+          cat > 'android/app/build.gradle' <<'HOLOEOF'
+          plugins { id "com.android.application" }
+          android {
+            namespace "de.kuestentexter.holosaver"
+            compileSdk 34
+            defaultConfig {
+              applicationId "de.kuestentexter.holosaver"
+              minSdk 24
+              targetSdk 34
+              versionCode (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+              versionName "1." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
+            }
+            signingConfigs {
+              rel { storeFile file("saver.jks"); storePassword "holosaver"; keyAlias "saver"; keyPassword "holosaver" }
+            }
+            buildTypes { release { minifyEnabled false; signingConfig signingConfigs.rel } }
+            compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+            androidResources { noCompress += ["html","js","woff2","png"] }
+          }
+          HOLOEOF
+          mkdir -p "$(dirname 'android/app/src/main/AndroidManifest.xml')"
+          cat > 'android/app/src/main/AndroidManifest.xml' <<'HOLOEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Holo-Logbuch Bildschirmschoner" android:icon="@drawable/icon" android:allowBackup="false" android:hardwareAccelerated="true">
+              <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+                <intent-filter>
+                  <action android:name="android.intent.action.VIEW" />
+                  <category android:name="android.intent.category.DEFAULT" />
+                  <category android:name="android.intent.category.BROWSABLE" />
+                  <data android:scheme="holosaver" />
+                </intent-filter>
+              </activity>
+              <activity android:name=".PreviewActivity" android:exported="false" android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" android:screenOrientation="unspecified" />
+              <service android:name=".HoloDream" android:exported="true" android:label="Holo-Logbuch" android:permission="android.permission.BIND_DREAM_SERVICE">
+                <intent-filter>
+                  <action android:name="android.service.dreams.DreamService" />
+                  <category android:name="android.intent.category.DEFAULT" />
+                </intent-filter>
+              </service>
+            </application>
+          </manifest>
+          HOLOEOF
+          mkdir -p "$(dirname 'android/app/src/main/java/de/kuestentexter/holosaver/Holo.java')"
+          cat > 'android/app/src/main/java/de/kuestentexter/holosaver/Holo.java' <<'HOLOEOF'
+          package de.kuestentexter.holosaver;
+
+          import android.annotation.SuppressLint;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import java.io.InputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.zip.Inflater;
+
+          /** Gemeinsame Teile: gespeicherter Zustand und die WebView, die das Holo-Logbuch offline aus den App-Daten lädt. */
+          final class Holo {
+              static final String HOST = "appassets.androidplatform.net";
+              private static final String PREFS = "holo";
+
+              private Holo() {}
+
+              static SharedPreferences prefs(Context c) { return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE); }
+
+              static String state(Context c) { return prefs(c).getString("state", null); }
+
+              /** d beginnt mit "p" (Base64url, unkomprimiert) oder "z" (Base64url, raw deflate). */
+              static String decode(String d) throws Exception {
+                  if (d == null || d.length() < 2) throw new IllegalArgumentException("leer");
+                  byte[] raw = Base64.decode(d.substring(1), Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
+                  if (d.charAt(0) == 'z') {
+                      Inflater inf = new Inflater(true);
+                      inf.setInput(raw);
+                      java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+                      byte[] buf = new byte[8192];
+                      while (!inf.finished()) {
+                          int n = inf.inflate(buf);
+                          if (n == 0 && (inf.needsInput() || inf.needsDictionary())) break;
+                          out.write(buf, 0, n);
+                      }
+                      inf.end();
+                      raw = out.toByteArray();
+                  }
+                  return new String(raw, StandardCharsets.UTF_8);
+              }
+
+              static final class Bridge {
+                  private final Context ctx;
+                  Bridge(Context ctx) { this.ctx = ctx.getApplicationContext(); }
+                  @JavascriptInterface public String state() { return Holo.state(ctx); }
+              }
+
+              @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
+              static WebView makeWebView(Context c) {
+                  WebView w = new WebView(c);
+                  w.setBackgroundColor(Color.BLACK);
+                  WebSettings s = w.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setAllowFileAccess(false);
+                  s.setAllowContentAccess(false);
+                  w.addJavascriptInterface(new Bridge(c), "HoloAndroid");
+                  final Context app = c.getApplicationContext();
+                  w.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                          if (!HOST.equals(req.getUrl().getHost())) return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, null);
+                          String path = req.getUrl().getPath();
+                          if (path == null || path.equals("/") || path.isEmpty()) path = "/index.html";
+                          try {
+                              InputStream in = app.getAssets().open("web" + path);
+                              return new WebResourceResponse(mime(path), mime(path).startsWith("text") || path.endsWith(".js") ? "utf-8" : null, in);
+                          } catch (Exception e) {
+                              return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, null);
+                          }
+                      }
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) { return !HOST.equals(req.getUrl().getHost()); }
+                  });
+                  w.loadUrl("https://" + HOST + "/index.html#saver");
+                  return w;
+              }
+
+              static String mime(String p) {
+                  if (p.endsWith(".html")) return "text/html";
+                  if (p.endsWith(".js")) return "application/javascript";
+                  if (p.endsWith(".css")) return "text/css";
+                  if (p.endsWith(".woff2")) return "font/woff2";
+                  if (p.endsWith(".png")) return "image/png";
+                  if (p.endsWith(".json") || p.endsWith(".webmanifest")) return "application/json";
+                  return "application/octet-stream";
+              }
+          }
+          HOLOEOF
+          mkdir -p "$(dirname 'android/app/src/main/java/de/kuestentexter/holosaver/HoloDream.java')"
+          cat > 'android/app/src/main/java/de/kuestentexter/holosaver/HoloDream.java' <<'HOLOEOF'
+          package de.kuestentexter.holosaver;
+
+          import android.service.dreams.DreamService;
+          import android.webkit.WebView;
+
+          /** Android-Bildschirmschoner: zeigt das Holo-Logbuch im Bildschirmschoner-Modus. */
+          public class HoloDream extends DreamService {
+              private WebView web;
+
+              @Override
+              public void onAttachedToWindow() {
+                  super.onAttachedToWindow();
+                  setInteractive(false);
+                  setFullscreen(true);
+                  setScreenBright(false);
+                  web = Holo.makeWebView(this);
+                  setContentView(web);
+              }
+
+              @Override
+              public void onDreamingStarted() {
+                  super.onDreamingStarted();
+                  if (web != null) web.onResume();
+              }
+
+              @Override
+              public void onDreamingStopped() {
+                  if (web != null) web.onPause();
+                  super.onDreamingStopped();
+              }
+
+              @Override
+              public void onDetachedFromWindow() {
+                  if (web != null) { web.destroy(); web = null; }
+                  super.onDetachedFromWindow();
+              }
+          }
+          HOLOEOF
+          mkdir -p "$(dirname 'android/app/src/main/java/de/kuestentexter/holosaver/MainActivity.java')"
+          cat > 'android/app/src/main/java/de/kuestentexter/holosaver/MainActivity.java' <<'HOLOEOF'
+          package de.kuestentexter.holosaver;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import org.json.JSONObject;
+
+          import java.text.DateFormat;
+          import java.util.Date;
+
+          /** Startseite der Bildschirmschoner-App. Empfängt außerdem die Übergabe aus dem Holo-Logbuch (holosaver://set?d=…). */
+          public class MainActivity extends Activity {
+              private static final int CYAN = Color.rgb(63, 244, 255);
+              private static final int TEXT = Color.rgb(220, 252, 255);
+              private static final int MUTED = Color.rgb(121, 174, 184);
+              private TextView status;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  buildUi();
+                  handle(getIntent());
+              }
+
+              @Override
+              protected void onNewIntent(Intent i) {
+                  super.onNewIntent(i);
+                  setIntent(i);
+                  handle(i);
+              }
+
+              private void handle(Intent i) {
+                  if (i == null || i.getData() == null) { paintStatus(); return; }
+                  Uri u = i.getData();
+                  if (!"holosaver".equals(u.getScheme())) { paintStatus(); return; }
+                  try {
+                      String json = Holo.decode(u.getQueryParameter("d"));
+                      JSONObject o = new JSONObject(json);
+                      Holo.prefs(this).edit().putString("state", json).putLong("time", System.currentTimeMillis()).apply();
+                      String name = o.optJSONObject("pet") != null ? o.getJSONObject("pet").optString("name", "Dein Tier") : "Dein Tier";
+                      Toast.makeText(this, name + " ist jetzt im Bildschirmschoner.", Toast.LENGTH_LONG).show();
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Übergabe fehlgeschlagen. Bitte im Holo-Logbuch erneut tippen.", Toast.LENGTH_LONG).show();
+                  }
+                  paintStatus();
+              }
+
+              private void paintStatus() {
+                  String st = Holo.state(this);
+                  if (st == null) {
+                      status.setText("Noch kein Tier übergeben.\n\nÖffne das Holo-Logbuch → Einstellungen → Meer und Darstellung → „An Android-Bildschirmschoner übergeben“.");
+                      return;
+                  }
+                  String name = "Dein Tier";
+                  try { JSONObject o = new JSONObject(st); if (o.optJSONObject("pet") != null) name = o.getJSONObject("pet").optString("name", name); } catch (Exception ignored) {}
+                  long t = Holo.prefs(this).getLong("time", 0);
+                  status.setText(name + " ist übernommen" + (t > 0 ? " (Stand: " + DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(new Date(t)) + ")." : "."));
+              }
+
+              private void buildUi() {
+                  int pad = dp(20);
+                  LinearLayout col = new LinearLayout(this);
+                  col.setOrientation(LinearLayout.VERTICAL);
+                  col.setPadding(pad, dp(36), pad, pad);
+                  col.setBackgroundColor(Color.BLACK);
+
+                  TextView h = new TextView(this);
+                  h.setText("Holo-Logbuch\nBildschirmschoner");
+                  h.setTextColor(CYAN);
+                  h.setTextSize(26);
+                  h.setTypeface(Typeface.DEFAULT_BOLD);
+                  col.addView(h);
+
+                  status = new TextView(this);
+                  status.setTextColor(TEXT);
+                  status.setTextSize(16);
+                  status.setPadding(0, dp(18), 0, dp(10));
+                  col.addView(status);
+
+                  col.addView(button("Vorschau ansehen", v -> startActivity(new Intent(this, PreviewActivity.class))));
+                  col.addView(button("Bildschirmschoner einstellen", v -> openDreamSettings()));
+
+                  TextView hint = new TextView(this);
+                  hint.setTextColor(MUTED);
+                  hint.setTextSize(14);
+                  hint.setPadding(0, dp(18), 0, 0);
+                  hint.setText("So geht's:\n1. „Bildschirmschoner einstellen“ tippen und „Holo-Logbuch“ wählen.\n2. Festlegen, wann er startet (z. B. beim Laden).\n\nWenn sich dein Tier verändert, meldet sich das Holo-Logbuch. Ein Tipp dort genügt, diese App musst du nicht neu installieren. Alles läuft offline.");
+                  col.addView(hint);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(Color.BLACK);
+                  sv.addView(col);
+                  setContentView(sv);
+              }
+
+              private Button button(String label, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(label);
+                  b.setAllCaps(false);
+                  b.setTextColor(CYAN);
+                  b.setTextSize(16);
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setColor(Color.argb(30, 63, 244, 255));
+                  bg.setStroke(dp(1), CYAN);
+                  bg.setCornerRadius(dp(12));
+                  b.setBackground(bg);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52));
+                  lp.topMargin = dp(10);
+                  b.setLayoutParams(lp);
+                  b.setGravity(Gravity.CENTER);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              private void openDreamSettings() {
+                  try { startActivity(new Intent(Settings.ACTION_DREAM_SETTINGS)); }
+                  catch (Exception e) {
+                      try { startActivity(new Intent(Settings.ACTION_DISPLAY_SETTINGS)); }
+                      catch (Exception e2) { Toast.makeText(this, "Einstellungen → Anzeige → Bildschirmschoner", Toast.LENGTH_LONG).show(); }
+                  }
+              }
+
+              private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+          }
+          HOLOEOF
+          mkdir -p "$(dirname 'android/app/src/main/java/de/kuestentexter/holosaver/PreviewActivity.java')"
+          cat > 'android/app/src/main/java/de/kuestentexter/holosaver/PreviewActivity.java' <<'HOLOEOF'
+          package de.kuestentexter.holosaver;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.WebView;
+
+          /** Vorschau des Bildschirmschoners im Vollbild. Zurück-Taste beendet. */
+          public class PreviewActivity extends Activity {
+              private WebView web;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  web = Holo.makeWebView(this);
+                  setContentView(web);
+                  web.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+              }
+
+              @Override protected void onPause() { if (web != null) web.onPause(); super.onPause(); }
+              @Override protected void onResume() { super.onResume(); if (web != null) web.onResume(); }
+              @Override protected void onDestroy() { if (web != null) { web.destroy(); web = null; } super.onDestroy(); }
+          }
+          HOLOEOF
+          mkdir -p "$(dirname 'android/build.gradle')"
+          cat > 'android/build.gradle' <<'HOLOEOF'
+          plugins { id "com.android.application" version "8.5.2" apply false }
+          HOLOEOF
+          mkdir -p "$(dirname 'android/gradle.properties')"
+          cat > 'android/gradle.properties' <<'HOLOEOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          HOLOEOF
+          mkdir -p "$(dirname 'android/settings.gradle')"
+          cat > 'android/settings.gradle' <<'HOLOEOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "HoloSaver"
+          include ":app"
+          HOLOEOF
+
+      - name: Holo-Logbuch in die App packen (offline)
+        run: |
+          W=android/app/src/main/assets/web
+          mkdir -p "$W" android/app/src/main/res/drawable
+          cp index.html "$W/"
+          for f in *.js *.woff2 *.png manifest.webmanifest; do [ -f "$f" ] && [ "$f" != "sw.js" ] && cp "$f" "$W/" || true; done
+          cp icon-192.png android/app/src/main/res/drawable/icon.png
+          echo "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" | base64 -d > android/app/saver.jks
+          ls -la "$W"
+
+      - name: APK bauen
+        working-directory: android
+        run: gradle --no-daemon assembleRelease
+
+      - name: Als Release veröffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk Holo-Bildschirmschoner.apk
+          gh release delete bildschirmschoner --yes --cleanup-tag || true
+          gh release create bildschirmschoner Holo-Bildschirmschoner.apk --title "Bildschirmschoner" --notes "Android-Bildschirmschoner für das Holo-Logbuch (Build ${{ github.run_number }}). Auf dem Handy herunterladen und installieren."
